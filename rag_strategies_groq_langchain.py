@@ -1,4 +1,3 @@
-
 """
 RAG Strategies (Basic RAG, RRR-RAG, Self-RAG) using:
 - Groq (LLM)
@@ -9,14 +8,15 @@ RAG Strategies (Basic RAG, RRR-RAG, Self-RAG) using:
 
 This script is extracted/cleaned from the course notebook:
 EngGenAI_Hamza_Junaid.ipynb
-
+"""
 
 from __future__ import annotations
 
 import argparse
 import os
+import time
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import bs4
 from groq import Groq
@@ -303,6 +303,140 @@ Refined retrieval query:
 
 
 # ----------------------------
+# Strategy comparison (answer quality + latency)
+# ----------------------------
+
+STRATEGIES = ("basic", "rrr", "self")
+
+ABSTENTION = "i don't know based on the provided context"
+
+
+def run_strategy(
+    strategy: str,
+    question: str,
+    vectorstore: Chroma,
+    k: int = 5,
+    iterations: int = 2,
+    groq_model: str = DEFAULT_GROQ_MODEL,
+) -> str:
+    """Dispatch one strategy by name and return its answer."""
+    if strategy == "basic":
+        return basic_rag_answer(question, vectorstore, k=k, groq_model=groq_model)
+    if strategy == "rrr":
+        return rrr_rag_answer(question, vectorstore, k=k, groq_model=groq_model)
+    if strategy == "self":
+        return self_rag(question, vectorstore, iterations=iterations, k=k, groq_model=groq_model)
+    raise ValueError(f"Unknown strategy: {strategy!r}")
+
+
+def judge_answer(
+    question: str,
+    answer: str,
+    vectorstore: Chroma,
+    k: int = 5,
+    groq_model: str = DEFAULT_GROQ_MODEL,
+) -> Optional[int]:
+    """
+    Optional LLM-as-judge quality score (1-5) for groundedness + completeness,
+    scored against the same retrieved context the strategies see. Returns None
+    if the model does not return a parseable integer.
+    """
+    context = _make_context(vectorstore.similarity_search(question, k=k))
+    prompt = f"""
+You are grading a RAG answer. Score it from 1 to 5 using ONLY the context below.
+
+Scoring guide:
+5 = fully grounded in the context and completely answers the question
+3 = partially grounded or partially complete
+1 = ungrounded, contradicts the context, or does not answer
+
+A correct "I don't know based on the provided context." when the context truly
+lacks the answer should score 5 (honest abstention), not 1.
+
+Output ONLY the integer score (1-5), nothing else.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer to grade:
+{answer}
+
+Score:
+""".strip()
+    raw = call_groq_llm(prompt, model=groq_model).strip()
+    for token in raw.replace("/", " ").split():
+        if token.isdigit():
+            value = int(token)
+            if 1 <= value <= 5:
+                return value
+    return None
+
+
+def compare_strategies(
+    question: str,
+    vectorstore: Chroma,
+    k: int = 5,
+    iterations: int = 2,
+    groq_model: str = DEFAULT_GROQ_MODEL,
+    judge: bool = False,
+) -> List[Dict[str, object]]:
+    """
+    Run every strategy on the same question/corpus and collect, per strategy:
+    measured latency (seconds), the full answer, length, whether it abstained,
+    and an optional LLM quality score. Deterministic order: basic, rrr, self.
+    """
+    results: List[Dict[str, object]] = []
+    for strategy in STRATEGIES:
+        start = time.perf_counter()
+        answer = run_strategy(
+            strategy, question, vectorstore, k=k, iterations=iterations, groq_model=groq_model
+        )
+        latency = time.perf_counter() - start
+        row: Dict[str, object] = {
+            "strategy": strategy,
+            "latency_s": round(latency, 3),
+            "answer": answer,
+            "chars": len(answer),
+            "abstained": ABSTENTION in answer.lower(),
+            "quality": None,
+        }
+        if judge:
+            row["quality"] = judge_answer(question, answer, vectorstore, k=k, groq_model=groq_model)
+        results.append(row)
+    return results
+
+
+def print_comparison(question: str, results: Sequence[Dict[str, object]], judged: bool) -> None:
+    print(f"\nQuestion: {question}\n")
+    header = f"{'strategy':<8} {'latency_s':>10} {'chars':>6} {'abstained':>10}"
+    if judged:
+        header += f" {'quality':>8}"
+    print(header)
+    print("-" * len(header))
+    for r in results:
+        line = f"{r['strategy']:<8} {r['latency_s']:>10} {r['chars']:>6} {str(r['abstained']):>10}"
+        if judged:
+            line += f" {('-' if r['quality'] is None else r['quality']):>8}"
+        print(line)
+
+    fastest = min(results, key=lambda r: r["latency_s"])
+    print(f"\nFastest: {fastest['strategy']} ({fastest['latency_s']}s)")
+    if judged and any(r["quality"] is not None for r in results):
+        best = max(
+            (r for r in results if r["quality"] is not None), key=lambda r: r["quality"]
+        )
+        print(f"Highest quality score: {best['strategy']} ({best['quality']}/5)")
+
+    print("\n--- Full answers (compare quality side by side) ---")
+    for r in results:
+        print(f"\n[{r['strategy']}]  ({r['latency_s']}s)")
+        print(r["answer"])
+
+
+# ----------------------------
 # Web corpus indexing (from notebook)
 # ----------------------------
 
@@ -379,6 +513,20 @@ def main() -> None:
     p_ask.add_argument("--k", type=int, default=5)
     p_ask.add_argument("--iterations", type=int, default=2)
 
+    p_cmp = sub.add_parser(
+        "compare",
+        help="Run all three strategies on the same question and compare answer quality and latency.",
+    )
+    p_cmp.add_argument("--corpus", choices=["local", "web"], default="local")
+    p_cmp.add_argument("--question", required=True)
+    p_cmp.add_argument("--k", type=int, default=5)
+    p_cmp.add_argument("--iterations", type=int, default=2)
+    p_cmp.add_argument(
+        "--judge",
+        action="store_true",
+        help="Also score each answer 1-5 for groundedness/completeness with an LLM judge.",
+    )
+
     args = parser.parse_args()
 
     # Initialize local store always (fast, small)
@@ -399,7 +547,7 @@ def main() -> None:
         print("[OK] Web vector store built.")
         return
 
-    # ask
+    # ask / compare both need a store
     store = local_store
     if args.corpus == "web":
         store = build_web_vectorstore(
@@ -408,6 +556,19 @@ def main() -> None:
             persist_dir=args.persist_dir,
         )
 
+    if args.cmd == "compare":
+        results = compare_strategies(
+            args.question,
+            store,
+            k=args.k,
+            iterations=args.iterations,
+            groq_model=args.groq_model,
+            judge=args.judge,
+        )
+        print_comparison(args.question, results, judged=args.judge)
+        return
+
+    # ask
     if args.strategy == "basic":
         out = basic_rag_answer(args.question, store, k=args.k, groq_model=args.groq_model)
     elif args.strategy == "rrr":
